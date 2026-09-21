@@ -27,6 +27,9 @@ export default async function pMap(
 		let isResolved = false;
 		let isIterableDone = false;
 		let resolvingCount = 0;
+		let pendingNextCount = 0;
+		let readCount = 0;
+		let doneAtRead = Number.POSITIVE_INFINITY;
 		let currentIndex = 0;
 		const iterator = iterable[Symbol.asyncIterator] === undefined ? iterable[Symbol.iterator]() : iterable[Symbol.asyncIterator]();
 
@@ -73,10 +76,28 @@ export default async function pMap(
 			}
 
 			// Once the source reported `done`, don't pull again like `for await`. A source like a queue may block in `next()` after it is exhausted, which would hang the completion below.
-			const nextItem = isIterableDone ? {done: true} : await iterator.next();
+			let nextItem;
+			if (isIterableDone) {
+				nextItem = {done: true};
+			} else {
+				const readIndex = readCount;
+				readCount++;
+				pendingNextCount++;
+				try {
+					nextItem = await iterator.next();
+				} finally {
+					pendingNextCount--;
+				}
 
-			const index = currentIndex;
-			currentIndex++;
+				if (nextItem.done) {
+					doneAtRead = Math.min(doneAtRead, readIndex);
+				} else if (readIndex > doneAtRead) {
+					// This read was started after the read the source reported
+					// `done` to, so `for await` would never have pulled it.
+					// Discard the item instead of mapping past the end of the input.
+					nextItem = {done: true};
+				}
+			}
 
 			// Note: `iterator.next()` can be called many times in parallel.
 			// This can cause multiple calls to this `next()` function to
@@ -87,7 +108,10 @@ export default async function pMap(
 			if (nextItem.done) {
 				isIterableDone = true;
 
-				if (resolvingCount === 0 && !isResolved) {
+				// A slow source may still have `next()` reads in flight that
+				// resolve with more items after another read reported `done`,
+				// so completion must wait for those reads too.
+				if (resolvingCount === 0 && pendingNextCount === 0 && !isResolved) {
 					if (!stopOnError && errors.length > 0) {
 						reject(new AggregateError(errors)); // eslint-disable-line unicorn/error-message
 						return;
@@ -116,6 +140,11 @@ export default async function pMap(
 
 				return;
 			}
+
+			// Assign indexes only to actual items so `done` pulls
+			// don't leave gaps in the result indexes.
+			const index = currentIndex;
+			currentIndex++;
 
 			resolvingCount++;
 
