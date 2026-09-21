@@ -23,10 +23,10 @@ export default async function pMap(
 		const result = [];
 		const errors = [];
 		const skippedIndexesMap = new Map();
-		let isRejected = false;
 		let isResolved = false;
 		let isIterableDone = false;
-		let resolvingCount = 0;
+		let pendingPullCount = 0;
+		let activeMapperCount = 0;
 		let currentIndex = 0;
 		const iterator = iterable[Symbol.asyncIterator] === undefined ? iterable[Symbol.iterator]() : iterable[Symbol.asyncIterator]();
 
@@ -48,7 +48,6 @@ export default async function pMap(
 				return;
 			}
 
-			isRejected = true;
 			isResolved = true;
 			reject_(reason);
 			cleanup();
@@ -67,119 +66,117 @@ export default async function pMap(
 			signal.addEventListener('abort', signalListener, {once: true});
 		}
 
-		const next = async () => {
-			if (isResolved) {
+		const maybeComplete = () => {
+			if (isResolved || !isIterableDone || pendingPullCount !== 0 || activeMapperCount !== 0) {
 				return;
 			}
 
-			// Once the source reported `done`, don't pull again like `for await`. A source like a queue may block in `next()` after it is exhausted, which would hang the completion below.
-			const nextItem = isIterableDone ? {done: true} : await iterator.next();
-
-			const index = currentIndex;
-			currentIndex++;
-
-			// Note: `iterator.next()` can be called many times in parallel.
-			// This can cause multiple calls to this `next()` function to
-			// receive a `nextItem` with `done === true`.
-			// The shutdown logic that rejects/resolves must be protected
-			// so it runs only one time as the `skippedIndex` logic is
-			// non-idempotent.
-			if (nextItem.done) {
-				isIterableDone = true;
-
-				if (resolvingCount === 0 && !isResolved) {
-					if (!stopOnError && errors.length > 0) {
-						reject(new AggregateError(errors)); // eslint-disable-line unicorn/error-message
-						return;
-					}
-
-					isResolved = true;
-
-					if (skippedIndexesMap.size === 0) {
-						resolve(result);
-						return;
-					}
-
-					const pureResult = [];
-
-					// Support multiple `pMapSkip`'s.
-					for (const [index, value] of result.entries()) {
-						if (skippedIndexesMap.get(index) === pMapSkip) {
-							continue;
-						}
-
-						pureResult.push(value);
-					}
-
-					resolve(pureResult);
-				}
-
+			if (!stopOnError && errors.length > 0) {
+				reject(new AggregateError(errors)); // eslint-disable-line unicorn/error-message
 				return;
 			}
 
-			resolvingCount++;
+			isResolved = true;
 
-			// Intentionally detached
-			(async () => {
-				try {
-					const element = await nextItem.value;
+			if (skippedIndexesMap.size === 0) {
+				resolve(result);
+				return;
+			}
 
-					if (isResolved) {
-						return;
-					}
+			const pureResult = [];
 
-					const value = await mapper(element, index);
-
-					// Use Map to stage the index of the element.
-					if (value === pMapSkip) {
-						skippedIndexesMap.set(index, value);
-					}
-
-					result[index] = value;
-				} catch (error) {
-					if (stopOnError) {
-						reject(error);
-						return;
-					}
-
-					errors.push(error);
+			// Support multiple `pMapSkip`'s.
+			for (const [index, value] of result.entries()) {
+				if (skippedIndexesMap.get(index) === pMapSkip) {
+					continue;
 				}
 
-				resolvingCount--;
+				pureResult.push(value);
+			}
 
-				// If the iterable throws we can't really continue regardless of `stopOnError` state
-				// since an iterable is likely to continue throwing after it throws once.
-				// If we continue calling `next()` indefinitely we will likely end up
-				// in an infinite loop of failed iteration.
-				try {
-					await next();
-				} catch (error) {
-					reject(error);
-				}
-			})();
+			resolve(pureResult);
 		};
 
-		// Create the concurrent runners in a detached (non-awaited)
-		// promise. We need this so we can await the `next()` calls
-		// to stop creating runners before hitting the concurrency limit
-		// if the iterable has already been marked as done.
-		// NOTE: We *must* do this for async iterators otherwise we'll spin up
-		// infinite `next()` calls by default and never start the event loop.
-		(async () => {
-			for (let index = 0; index < concurrency; index++) {
-				try {
-					// eslint-disable-next-line no-await-in-loop
-					await next();
-				} catch (error) {
-					reject(error);
-					break;
+		const processItem = async (item, index) => {
+			activeMapperCount++;
+
+			try {
+				const element = await item;
+
+				if (isResolved) {
+					return;
 				}
 
-				if (isIterableDone || isRejected) {
-					break;
+				const value = await mapper(element, index);
+
+				// Use Map to stage the index of the element.
+				if (value === pMapSkip) {
+					skippedIndexesMap.set(index, value);
+				}
+
+				result[index] = value;
+			} catch (error) {
+				if (stopOnError) {
+					reject(error);
+					return;
+				}
+
+				errors.push(error);
+			} finally {
+				activeMapperCount--;
+				maybeComplete();
+			}
+		};
+
+		const runWorker = async () => {
+			while (!isIterableDone) {
+				if (isResolved) {
+					return;
+				}
+
+				pendingPullCount++;
+
+				let nextItem;
+
+				try {
+					// eslint-disable-next-line no-await-in-loop
+					nextItem = await iterator.next();
+				} catch (error) {
+					pendingPullCount--;
+					reject(error);
+					return;
+				}
+
+				pendingPullCount--;
+
+				if (isResolved) {
+					return;
+				}
+
+				if (nextItem.done) {
+					isIterableDone = true;
+					maybeComplete();
+					return;
+				}
+
+				const index = currentIndex++;
+
+				if (concurrency === Number.POSITIVE_INFINITY) {
+					processItem(nextItem.value, index);
+				} else {
+					// eslint-disable-next-line no-await-in-loop
+					await processItem(nextItem.value, index);
 				}
 			}
-		})();
+		};
+
+		if (concurrency === Number.POSITIVE_INFINITY) {
+			runWorker();
+		} else {
+			for (let index = 0; index < concurrency; index++) {
+				runWorker();
+			}
+		}
 	});
 }
 
